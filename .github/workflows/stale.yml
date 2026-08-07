@@ -1,9 +1,6 @@
 name: Stale Triage
 
 on:
-  schedule:
-    # Daily weekday pass during US morning hours.
-    - cron: '17 15 * * 1-5'
   workflow_dispatch:
 
 permissions:

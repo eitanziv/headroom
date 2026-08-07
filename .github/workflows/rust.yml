@@ -13,12 +13,6 @@ on:
   push:
     branches: [ main, rust-rewrite ]
   pull_request:
-  schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Redundant with the
-    # per-PR gate below, but catches drift from toolchain/dependency updates
-    # that land without touching any filtered path.
-    - cron: '17 7 * * 1-5'
-
 concurrency:
   group: rust-${{ github.ref }}
   cancel-in-progress: true
