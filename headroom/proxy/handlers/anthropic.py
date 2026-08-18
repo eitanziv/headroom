@@ -34,6 +34,11 @@ from headroom.proxy.auth_mode import (
     classify_client,
     supports_mid_turn_coalescing,
 )
+from headroom.proxy.buffered_ccr_response import (
+    ANTHROPIC_ERROR_FORMAT,
+    DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+    buffered_ccr_asgi_call,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -312,6 +317,72 @@ class AnthropicHandlerMixin:
             if isinstance(function, dict) and function.get("name") == "headroom_retrieve":
                 return True
         return False
+
+    def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
+        """May this upstream response be relayed when post-processing failed?
+
+        Only when the client can actually consume it. The buffered path exists
+        because a ``headroom_retrieve`` call has to be resolved server-side, so
+        a response still carrying one is exactly the case the handler already
+        fails closed on: relaying it would hand the client a tool call naming an
+        endpoint it is not expected to reach, and a marker nobody expanded.
+
+        Anything else — an ordinary answer, a client tool call, a turn whose
+        retrieval already resolved — is a complete provider turn and is safer in
+        the client's hands than a synthesized error (#3088).
+        """
+        if not isinstance(resp_json, dict):
+            return False
+        handler = getattr(self, "ccr_response_handler", None)
+        if handler is None:
+            return True
+        try:
+            from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+            if handler.residual_ccr_status(resp_json, "anthropic") == RESIDUAL_CCR_ERROR:
+                return False
+            return not handler.has_ccr_tool_calls(resp_json, "anthropic")
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CCR: salvage check failed; not salvaging", exc_info=True)
+            return False
+
+    @staticmethod
+    def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
+        """Does the body about to be sent carry a marker retrieval could expand?
+
+        ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
+        a request carrying none cannot benefit from the buffered path (#3071).
+
+        Ownership is verified rather than shape-matched: the marker shape is not
+        unique to Headroom, and adopting another context tool's hash would send
+        the model to an endpoint that is guaranteed to miss (#2836). A hash that
+        survives ``verify_ownership`` is redeemable right now.
+
+        Errors are swallowed deliberately and answered ``True``. This gates a
+        wire-format decision, and the safe direction on an unexpected message
+        shape is the long-standing buffered behavior, not a silent change.
+        """
+        if not isinstance(body, dict):
+            return True
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
+        try:
+            from headroom.ccr.tool_injection import CCRToolInjector
+
+            probe = CCRToolInjector(
+                provider="anthropic",
+                inject_tool=False,
+                inject_system_instructions=False,
+            )
+            probe.scan_for_markers(messages)
+            if not probe.detected_hashes:
+                return False
+            probe.verify_ownership()
+            return bool(probe.detected_hashes)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
+            return True
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -1932,22 +2003,35 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
+            _overlay_replayed = False
             # On a confirmed-cold turn we deliberately do NOT replay the previously
             # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
             # and the replay would clobber the whole-prefix recompaction we just did.
-            if _cold_recompact_active:
-                _overlay_replayed = False
+            if _decision.should_compress and not _skip_compression_for_backpressure:
+                if _cold_recompact_active:
+                    _overlay_replayed = False
+                else:
+                    _ov = overlay_cached_prefix(
+                        optimized_messages,
+                        original_client_messages,
+                        previous_original_messages,
+                        previous_forwarded_messages,
+                    )
+                    _overlay_replayed = _ov != optimized_messages
+                    if _overlay_replayed:
+                        optimized_messages = _ov
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
             else:
-                _ov = overlay_cached_prefix(
-                    optimized_messages,
-                    original_client_messages,
-                    previous_original_messages,
-                    previous_forwarded_messages,
+                replay_skip_reason = (
+                    "pre_upstream_backpressure"
+                    if _skip_compression_for_backpressure
+                    else _decision.passthrough_reason
                 )
-                _overlay_replayed = _ov != optimized_messages
-                if _overlay_replayed:
-                    optimized_messages = _ov
-                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                logger.debug(
+                    "[%s] Cached-prefix replay skipped: reason=%s",
+                    request_id,
+                    replay_skip_reason,
+                )
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
@@ -3183,7 +3267,12 @@ class AnthropicHandlerMixin:
                         # Track metrics
                         total_latency = (time.time() - start_time) * 1000
                         usage = backend_response.body.get("usage", {})
-                        output_tokens = usage.get("output_tokens", 0)
+                        # A backend may report these counters as JSON null (key
+                        # present, value null), for which ``.get(key, 0)`` returns
+                        # ``None`` rather than the default. Coerce with ``or 0`` so
+                        # the arithmetic below (and ``RequestOutcome``) never sees
+                        # ``None`` — matching the direct-Anthropic path.
+                        output_tokens = int(usage.get("output_tokens", 0) or 0)
 
                         _backend_name = request_backend.name if request_backend else "anthropic"
                         # Eligible-only denominator for the active
@@ -3202,8 +3291,8 @@ class AnthropicHandlerMixin:
                         except Exception:
                             attempted_input_tokens = original_tokens
 
-                        cr_tokens = usage.get("cache_read_input_tokens", 0)
-                        cw_tokens = usage.get("cache_creation_input_tokens", 0)
+                        cr_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                        cw_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
@@ -3363,13 +3452,40 @@ class AnthropicHandlerMixin:
                     body=body,
                     original_body_bytes=original_body_bytes,
                 )
-                wants_buffered_stream_ccr = bool(
+                # ``headroom_retrieve`` stays resident for the session lifetime so
+                # the tools array is byte-stable and the prompt cache survives, so
+                # its mere presence is a poor reason to buffer. Once a session went
+                # sticky, *every* later streaming turn took the buffered path, and
+                # buffering replaces incremental delivery with one write at the
+                # end: time-to-last-byte is roughly unchanged, but time-to-first-
+                # byte becomes the entire generation. In the traffic reported in
+                # #3071 that was 8s on average and up to 100s, on 234 requests in
+                # a single day.
+                #
+                # The tool can only expand a marker that is in the outgoing body
+                # and redeemable now, so a turn carrying none cannot benefit from
+                # server-side retrieval and should keep streaming. This reads
+                # ``body`` rather than the earlier scan of ``optimized_messages``
+                # because memory hooks, pre-send extensions and the CCR/tool-search
+                # repairs can all replace the message list after that scan; the
+                # only list that matters is the one about to go on the wire.
+                retrieve_tool_is_offered = (
                     stream
                     and ccr_response_handler_enabled
                     and self._has_headroom_retrieve_tool(
                         tools if tools is not None else body.get("tools")
                     )
                 )
+                buffered_retrieval_can_help = (
+                    retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
+                )
+                wants_buffered_stream_ccr = bool(buffered_retrieval_can_help)
+                if retrieve_tool_is_offered and not buffered_retrieval_can_help:
+                    logger.info(
+                        f"[{request_id}] CCR: headroom_retrieve is resident but this "
+                        "request carries no redeemable marker, so server-side "
+                        "retrieval cannot fire; keeping the streaming path (#3071)"
+                    )
                 buffered_stream_ccr = (
                     wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
                 )
@@ -3527,6 +3643,9 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                     )
                 else:
+                    # Populated once the upstream answers 200 with parseable
+                    # JSON, so the guard below can fall back to it (#3088).
+                    _salvageable_upstream: dict[str, Any] = {}
 
                     async def _buffered_ccr_operation():
                         async with stage_timer.measure("upstream_connect"):
@@ -3698,6 +3817,16 @@ class AnthropicHandlerMixin:
                         resp_json = None
                         try:
                             resp_json = response.json()
+                            if buffered_stream_ccr and response.status_code == 200 and resp_json:
+                                # Remember the upstream's own answer before any
+                                # post-processing touches it. Everything from here
+                                # to the SSE resynthesis — retrieval, memory tool
+                                # calls, turn hooks, usage accounting, caching — is
+                                # work layered on top of a turn the provider has
+                                # already produced and billed. If any of it raises
+                                # unexpectedly, this is what the client should get
+                                # instead of a synthesized error (#3088).
+                                _salvageable_upstream["resp_json"] = resp_json
                         except (json.JSONDecodeError, ValueError) as e:
                             # DEBUG is right for the buffered non-stream path, where
                             # an unparseable body is just "no CCR handling". On the
@@ -4413,59 +4542,81 @@ class AnthropicHandlerMixin:
                             headers=response_headers,
                         )
 
+                async def _buffered_ccr_operation_salvaging():
+                    """Never trade a successful upstream turn for a synthesized error.
+
+                    Everything the buffered path does after the provider answers
+                    — server-side retrieval, memory tool calls, turn hooks, usage
+                    accounting, caching, SSE resynthesis — is post-processing on
+                    a turn that already succeeded and was already billed. When a
+                    step raised unexpectedly the whole turn surfaced as a generic
+                    ``api_error``, so the client lost a complete 69KB answer the
+                    provider had produced (#3088), and the cause was unlogged.
+
+                    Relay the upstream's own answer instead. Two things are
+                    deliberately preserved: the exception is logged with a
+                    traceback so the real defect stays diagnosable rather than
+                    being papered over, and a response the client cannot safely
+                    consume is never salvaged — see ``_can_salvage``.
+                    """
+                    try:
+                        return await _buffered_ccr_operation()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        salvaged = _salvageable_upstream.get("resp_json")
+                        if salvaged is None or not self._can_salvage_buffered_upstream(salvaged):
+                            raise
+                        logger.error(
+                            f"[{request_id}] CCR: buffered post-processing failed after a "
+                            "successful upstream turn; relaying the upstream response "
+                            "instead of failing the request (#3088)",
+                            exc_info=True,
+                        )
+                        try:
+                            events = self._response_to_sse(salvaged, "anthropic")
+                        except Exception:
+                            logger.error(
+                                f"[{request_id}] CCR: could not resynthesize the salvaged "
+                                "upstream response; failing the request",
+                                exc_info=True,
+                            )
+                            raise
+
+                        async def _salvaged_sse():
+                            for event in events:
+                                yield event
+
+                        return StreamingResponse(
+                            _salvaged_sse(),
+                            media_type="text/event-stream",
+                        )
+
                 if buffered_stream_ccr:
-                    operation = asyncio.create_task(_buffered_ccr_operation())
-                    record_failed = self.metrics.record_failed
+                    operation = asyncio.create_task(_buffered_ccr_operation_salvaging())
+
+                    # Holds out for the real status, then keeps the stream alive
+                    # once waiting silently would risk the client's idle
+                    # watchdog. Both halves live in one shared place so the
+                    # OpenAI twin cannot drift from it (#3079).
+                    _buffered_call = buffered_ccr_asgi_call(
+                        operation=operation,
+                        fmt=ANTHROPIC_ERROR_FORMAT,
+                        grace_seconds=getattr(
+                            self.config,
+                            "buffered_ccr_grace_seconds",
+                            DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+                        ),
+                        record_failed=self.metrics.record_failed,
+                        request_id=request_id,
+                    )
 
                     class _BufferedCCRResponse(Response):
                         async def __call__(self, scope, receive, send):  # noqa: ANN001
-                            # Send nothing until the buffered operation resolves.
-                            # The previous keepalive preamble committed
-                            # `200 text/event-stream` after 1s, i.e. before the
-                            # outcome was known: any upstream reply that then
-                            # failed to become SSE (non-200, unparseable body)
-                            # reached the client as a 200 whose body carried no
-                            # `message_start`, which Claude Code reports as "API
-                            # returned an empty or malformed response (HTTP 200) —
-                            # check for a proxy or gateway intercepting the
-                            # request". The real status was lost with it, so
-                            # client-side 429/5xx backoff never fired. Clients
-                            # budget minutes for a turn (Claude Code sends
-                            # `x-stainless-timeout: 600`), so waiting is free.
-                            try:
-                                result = await operation
-                            except Exception as e:
-                                await record_failed(provider=provider_name)
-                                logger.error(
-                                    f"[{request_id}] Request failed: {type(e).__name__}: {e}"
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.start",
-                                        "status": 502,
-                                        "headers": [(b"content-type", b"application/json")],
-                                    }
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.body",
-                                        "body": json.dumps(
-                                            {
-                                                "type": "error",
-                                                "error": {
-                                                    "type": "api_error",
-                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                },
-                                            }
-                                        ).encode(),
-                                        "more_body": False,
-                                    }
-                                )
-                                return
-                            await result(scope, receive, send)
+                            await _buffered_call(scope, receive, send)
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
-                return await _buffered_ccr_operation()
+                return await _buffered_ccr_operation_salvaging()
             except HTTPException:
                 # FastAPI HTTPException carries its own status code, headers,
                 # and client-facing message (e.g. 429 with Retry-After, 413 for
