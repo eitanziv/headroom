@@ -51,6 +51,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import (
+    DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
@@ -5201,8 +5202,15 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(content)
+                        # output can still be losslessly compacted, UNLESS this is
+                        # a file read: every fold rewrites the bytes the model
+                        # copies into `Edit(old_string=…)`, and a missed edit costs
+                        # a whole turn (see DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS).
+                        compacted = (
+                            None
+                            if is_tool_excluded(tool_name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS)
+                            else self._lossless_compact_excluded(content)
+                        )
                         if compacted is not None:
                             folded, kind = compacted
                             result_slots[i] = {**message, "content": folded}
@@ -5760,13 +5768,22 @@ class ContentRouter(Transform):
         * LOG (build/test/app logs) -> ANSI strip + run-collapse. Recoverable
           modulo non-semantic ANSI color (``expand_runs`` restores the lines).
         * JSON -> whitespace-minify. **Data-lossless** (``json.loads`` equals the
-          original object) — same information, fewer tokens. NOT byte-exact, so a
-          read-then-``Edit(old_string=…)`` on the *same* JSON file could miss; the
-          data is fully preserved.
+          original object) — same information, fewer tokens. NOT byte-exact.
+
+        "Information-preserving" is the guarantee, and it is weaker than it looks
+        from in here: recoverability is OURS, but the string the model copies into
+        the next ``Edit(old_string=…)`` is the one we SHOWED it. All three folds
+        show something the file does not contain — minified JSON, ``... (repeated
+        N times)``, a hoisted path heading — so all three break a read-then-edit.
+        Callers must therefore NOT route a file read here: every call site gates
+        on ``DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS`` (and the stricter
+        ``DEFAULT_VERBATIM_EXCLUDE_TOOLS``, which covers Copilot's ``view``) first.
+        This function takes only ``content`` and cannot make that call itself —
+        which is also why the pluggable provider below, being content-only, is
+        never handed a read.
 
         Returns ``(compacted, kind)`` when a recognized shape actually shrinks,
         else ``None``. Source code and glob path-lists match nothing -> verbatim.
-        Always safe to run (information-preserving) so there is no feature gate.
         Never raises.
         """
         if not isinstance(content, str):
@@ -6174,8 +6191,15 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(block.get("content"))
+                        # output can still be losslessly compacted, UNLESS this is
+                        # a file read (see DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS). This
+                        # is the shape Claude Code's own `Read` arrives in, so it
+                        # has to carry the same guard as the OpenAI branch above.
+                        compacted = (
+                            None
+                            if is_tool_excluded(tool_name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS)
+                            else self._lossless_compact_excluded(block.get("content"))
+                        )
                         if compacted is not None:
                             folded, kind = compacted
                             new_blocks.append({**block, "content": folded})
